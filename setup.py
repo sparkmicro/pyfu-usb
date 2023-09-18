@@ -31,6 +31,7 @@ setuptools.setup(
     install_requires=[
         "pyusb>=1.0.2",
         "rich>=12.2",
+        "libusb_package>=1.0.26.2"
     ],
     extras_require={
         "dev": [

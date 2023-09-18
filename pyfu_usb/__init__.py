@@ -10,9 +10,16 @@
 
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 
 import usb
+from usb.backend import libusb1
+import platform
+backend = None
+if platform.system().lower() == "windows":
+    import libusb_package
+    backend = libusb1.get_backend(find_library=libusb_package.find_library)
+
 from rich.progress import Progress, TaskID
 
 from . import descriptor, dfu, dfuse
@@ -22,7 +29,7 @@ _BYTES_PER_KILOBYTE = 1024
 logger = logging.getLogger(__name__)
 
 
-def _make_progress_bar(progress: Progress, total: int) -> Optional[TaskID]:
+def _make_progress_bar(progress: Progress, total: int, text="") -> Optional[TaskID]:
     """Create task for rich progress bar, but only if logging level is not
     DEBUG since they would conflict on the output.
 
@@ -34,7 +41,7 @@ def _make_progress_bar(progress: Progress, total: int) -> Optional[TaskID]:
     """
     if logger.getEffectiveLevel() != logging.DEBUG:
         return progress.add_task(
-            "[blue]Downloading firmware",
+            text,
             total=total,
             start_task=False,
         )
@@ -42,7 +49,7 @@ def _make_progress_bar(progress: Progress, total: int) -> Optional[TaskID]:
     return None
 
 
-def _get_dfu_devices(
+def get_dfu_devices(
     vid: Optional[int] = None, pid: Optional[int] = None
 ) -> List[usb.core.Device]:
     """Get USB devices in DFU mode.
@@ -70,7 +77,31 @@ def _get_dfu_devices(
                                 return True
             return False
 
-    return list(usb.core.find(find_all=True, custom_match=FilterDFU()))
+    return list(usb.core.find(find_all=True, custom_match=FilterDFU(), backend=backend))
+
+
+def _dfuse_erase(
+    dev: usb.core.Device,
+    interface: int,
+) -> None:
+
+    with Progress() as progress:
+        for segment_num, segment in enumerate(
+            descriptor.get_memory_layout(dev, interface)
+        ):
+            task = _make_progress_bar(progress, segment.num_pages, "[blue]Erasing flash")
+            for page_num in range(segment.num_pages):
+                page_addr = segment.addr + page_num * segment.page_size
+                logger.info(
+                    "Erasing page 0x%X of size %d in segment %d",
+                    page_addr,
+                    segment.page_size,
+                    segment_num,
+                )
+
+                dfuse.page_erase(dev, interface, page_addr)
+                if task is not None:
+                    progress.update(task, advance=1)
 
 
 def _dfuse_download(
@@ -79,6 +110,7 @@ def _dfuse_download(
     data: bytes,
     xfer_size: int,
     start_address: int,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     """Download data to DfuSe device.
 
@@ -89,27 +121,12 @@ def _dfuse_download(
         xfer_size: Transfer size to use when downloading.
         start_address: Start address of data in device memory.
     """
-    # Clear status, possibly leftover from previous transaction
-    dfu.clear_status(dev, interface)
 
-    for segment_num, segment in enumerate(
-        descriptor.get_memory_layout(dev, interface)
-    ):
-        for page_num in range(segment.num_pages):
-            page_addr = segment.addr + page_num * segment.page_size
-            if start_address <= page_addr <= start_address + len(data):
-                logger.info(
-                    "Erasing page 0x%X of size %d in segment %d",
-                    page_addr,
-                    segment.page_size,
-                    segment_num,
-                )
-
-                dfuse.page_erase(dev, interface, page_addr)
+    _dfuse_erase(dev, interface)
 
     # Download data
     with Progress() as progress:
-        task = _make_progress_bar(progress, len(data))
+        task = _make_progress_bar(progress, len(data), "[blue]Downloading firmware")
 
         bytes_downloaded = 0
         while bytes_downloaded < len(data):
@@ -128,6 +145,8 @@ def _dfuse_download(
             dfu.download(dev, interface, 2, chunk)
 
             bytes_downloaded += chunk_size
+            if progress_callback:
+                progress_callback(bytes_downloaded, len(data))
             if task is not None:
                 progress.update(task, advance=chunk_size)
 
@@ -138,11 +157,15 @@ def _dfuse_download(
     try:
         dfu.download(dev, interface, 0, None)
     except usb.core.USBError as err:
-        logger.warning("Ignoring USB error when exiting DFU: %s", err)
+        logger.debug("Ignoring USB error when exiting DFU: %s", err)
 
 
 def _dfu_download(
-    dev: usb.core.Device, interface: int, data: bytes, xfer_size: int
+    dev: usb.core.Device,
+    interface: int,
+    data: bytes,
+    xfer_size: int,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     """Download data to DFU device.
 
@@ -154,7 +177,7 @@ def _dfu_download(
     """
     # Download data
     with Progress() as progress:
-        task = _make_progress_bar(progress, len(data))
+        task = _make_progress_bar(progress, len(data), "[blue]Downloading firmware")
 
         transaction = 0
         bytes_downloaded = 0
@@ -172,6 +195,8 @@ def _dfu_download(
 
             transaction += 1
             bytes_downloaded += chunk_size
+            if progress_callback:
+                progress_callback(bytes_downloaded, len(data))
             if task is not None:
                 progress.update(task, advance=chunk_size)
 
@@ -190,7 +215,7 @@ def list_devices(vid: Optional[int] = None, pid: Optional[int] = None) -> None:
         vid: Vendor ID to narrow the search for DFU devices.
         pid: Product ID to narrow the search for DFU devices.
     """
-    for device in _get_dfu_devices(vid=vid, pid=pid):
+    for device in get_dfu_devices(vid=vid, pid=pid):
         logger.info(
             "Bus {} Device {:03d}: ID {:04x}:{:04x}".format(
                 device.bus, device.address, device.idVendor, device.idProduct
@@ -220,6 +245,38 @@ def list_devices(vid: Optional[int] = None, pid: Optional[int] = None) -> None:
                         )
                     )
 
+def full_erase(
+    interface: int = 0,
+    vid: Optional[int] = None,
+    pid: Optional[int] = None,
+) -> None:
+
+    devices = get_dfu_devices(vid=vid, pid=pid)
+
+    if not devices:
+        raise RuntimeError("No devices found in DFU mode")
+
+    if len(devices) > 1:
+        raise RuntimeError(
+            f"Too many devices in DFU mode ({len(devices)}). List devices for "
+            "more info and specify vid:pid to filter."
+        )
+
+    dev = devices[0]
+
+    try:
+        dfu.claim_interface(dev, interface)
+
+        dfu_desc = descriptor.get_dfu_descriptor(dev)
+        if dfu_desc is None:
+            raise ValueError("No DFU descriptor, is this a valid DFU device?")
+
+        if dfu_desc.bcdDFUVersion == dfuse.DFUSE_VERSION_NUMBER:
+            _dfuse_erase(dev, interface)
+        else:
+            raise ValueError("Erase not supported on this device")
+    finally:
+        dfu.release_interface(dev)
 
 def download(
     filename: str,
@@ -227,6 +284,7 @@ def download(
     vid: Optional[int] = None,
     pid: Optional[int] = None,
     address: Optional[int] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> None:
     """Download a file to the DFU device defined by vid:pid. If vid:pid is not
     provided and only one DFU device is present, that device will be used.
@@ -247,7 +305,7 @@ def download(
     with open(filename, "rb") as fin:
         data = fin.read()
 
-    devices = _get_dfu_devices(vid=vid, pid=pid)
+    devices = get_dfu_devices(vid=vid, pid=pid)
 
     if not devices:
         raise RuntimeError("No devices found in DFU mode")
@@ -271,9 +329,9 @@ def download(
             if address is None:
                 raise ValueError("Must provide address for DfuSe")
             _dfuse_download(
-                dev, interface, data, dfu_desc.wTransferSize, address
+                dev, interface, data, dfu_desc.wTransferSize, address, progress_callback
             )
         else:
-            _dfu_download(dev, interface, data, dfu_desc.wTransferSize)
+            _dfu_download(dev, interface, data, dfu_desc.wTransferSize, progress_callback)
     finally:
         dfu.release_interface(dev)
