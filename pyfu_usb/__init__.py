@@ -335,3 +335,59 @@ def download(
             _dfu_download(dev, interface, data, dfu_desc.wTransferSize, progress_callback)
     finally:
         dfu.release_interface(dev)
+
+
+def reset(
+    interface: int = 0,
+    vid: Optional[int] = None,
+    pid: Optional[int] = None,
+    address: Optional[int] = None,
+) -> None:
+    """Reset a DFU device defined by vid:pid. If vid:pid is not
+    provided and only one DFU device is present, that device will be used.
+
+    Args:
+        interface: USB device interface.
+        vid: Vendor ID to narrow the search for DFU devices.
+        pid: Product ID to narrow the search for DFU devices.
+        address: Base address to jump to in memory. This is required for DfuSe.
+
+    Raises:
+        ValueError: Could not read DFU device USB descriptor.
+        ValueError: Address not provided for DfuSe device.
+        RuntimeError: Could not locate DFU device.
+    """
+
+    devices = get_dfu_devices(vid=vid, pid=pid)
+
+    if not devices:
+        raise RuntimeError("No devices found in DFU mode")
+
+    if len(devices) > 1:
+        raise RuntimeError(
+            f"Too many devices in DFU mode ({len(devices)}). List devices for "
+            "more info and specify vid:pid to filter."
+        )
+
+    dev = devices[0]
+
+    try:
+        dfu.claim_interface(dev, interface)
+
+        dfu_desc = descriptor.get_dfu_descriptor(dev)
+        if dfu_desc is None:
+            raise ValueError("No DFU descriptor, is this a valid DFU device?")
+
+        if dfu_desc.bcdDFUVersion == dfuse.DFUSE_VERSION_NUMBER:
+            if address is None:
+                raise ValueError("Must provide address for DfuSe")
+            # Set jump address
+            dfuse.set_address(dev, interface, address)
+
+        # End with empty download
+        dfu.download(dev, interface, 0, None)
+    except usb.core.USBError as err:
+        logger.debug("Ignoring USB error when exiting DFU: %s", err)
+
+    finally:
+        dfu.release_interface(dev)
