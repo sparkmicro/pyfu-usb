@@ -151,7 +151,7 @@ def _dfuse_download(
                 progress.update(task, advance=chunk_size)
 
     # Set jump address
-    dfuse.set_address(dev, interface, start_address)
+    dfuse.set_address(dev, interface, start_address+1)
 
     # End with empty download
     try:
@@ -382,7 +382,7 @@ def reset(
             if address is None:
                 raise ValueError("Must provide address for DfuSe")
             # Set jump address
-            dfuse.set_address(dev, interface, address)
+            dfuse.set_address(dev, interface, address+1)
 
         # End with empty download
         dfu.download(dev, interface, 0, None)
